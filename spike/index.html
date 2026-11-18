@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Lifting Coach phone test</title>
+<!--
+  WP1b: can Safari on the iPhone do the analysis?
+  Pick a clip from Photos. The page reads every frame of the file (WebCodecs + mp4box.js),
+  runs the MediaPipe pose model at three sizes (lite, full, heavy), draws the skeleton,
+  and fills in a results box. The video never leaves the phone: nothing is uploaded.
+  Libraries are pinned: @mediapipe/tasks-vision 1.2.2 (same version as the PC's mediapipe==1.2.2), mp4box 2.5.0.
+-->
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #5f6368; --card: #f4f5f7; --line: #d9dce1;
+    --accent: #1a5fd0; --pass: #137333; --fail: #b3261e; --warn: #8a5a00;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121314; --fg: #e8eaed; --muted: #a0a4a9; --card: #1e2022; --line: #33363a;
+      --accent: #7aa7ff; --pass: #6dd58c; --fail: #ff8a80; --warn: #f2c14e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; padding-bottom: calc(16px + env(safe-area-inset-bottom));
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    max-width: 640px; margin-inline: auto;
+  }
+  h1 { font-size: 1.35rem; margin: 0 0 4px; }
+  p.lead { margin: 0 0 16px; color: var(--muted); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+  label.pick {
+    display: block; text-align: center; padding: 14px; border-radius: 10px;
+    background: var(--accent); color: #fff; font-weight: 600; cursor: pointer;
+  }
+  input[type=file] { display: none; }
+  .models { display: flex; gap: 14px; flex-wrap: wrap; margin: 12px 0 4px; }
+  .models label { display: flex; align-items: center; gap: 6px; }
+  button {
+    font: inherit; font-weight: 600; padding: 12px 16px; border-radius: 10px; border: 1px solid var(--line);
+    background: var(--bg); color: var(--fg); cursor: pointer; width: 100%; margin-top: 10px;
+  }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button:disabled { opacity: 0.45; cursor: default; }
+  #status { font-weight: 600; margin: 0 0 6px; }
+  progress { width: 100%; height: 10px; }
+  canvas#view { display: block; width: 100%; max-width: 360px; margin: 10px auto 0; background: #000; border-radius: 8px; }
+  pre#results {
+    white-space: pre-wrap; word-break: break-word; margin: 0;
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .verdict { font-size: 1.15rem; font-weight: 700; margin-bottom: 8px; }
+  .go { color: var(--pass); } .nogo { color: var(--fail); } .warn { color: var(--warn); }
+  #crash { display: none; border-color: var(--fail); }
+  small { color: var(--muted); }
+</style>
+</head>
+<body>
+<h1>Lifting Coach: phone test</h1>
+<p class="lead">Checks whether this phone can run the pose model on a 60 fps clip. Your video stays on the phone. Nothing is uploaded.</p>
+
+<div class="card" id="crash">
+  <div class="verdict nogo">The last run did not finish</div>
+  <div id="crashText"></div>
+</div>
+
+<div class="card">
+  <label class="pick" for="file">1. Choose a 10-second clip</label>
+  <input type="file" id="file" accept="video/*,.mov,.mp4">
+  <div id="fileInfo" style="margin-top:8px"><small>No clip chosen yet.</small></div>
+  <div class="models">
+    <label><input type="checkbox" value="lite" checked> lite</label>
+    <label><input type="checkbox" value="full" checked> full</label>
+    <label><input type="checkbox" value="heavy" checked> heavy</label>
+  </div>
+  <small>Keep the screen on and this page open until it says Finished. All three sizes can take several minutes.</small>
+  <button class="primary" id="run" disabled>2. Run the test</button>
+  <button id="stop" disabled>Stop</button>
+</div>
+
+<div class="card">
+  <p id="status">Waiting for a clip.</p>
+  <progress id="bar" max="1" value="0"></progress>
+  <canvas id="view" width="360" height="640"></canvas>
+</div>
+
+<div class="card">
+  <div class="verdict" id="verdict">Results</div>
+  <pre id="results">No results yet.</pre>
+  <button id="copy" disabled>Copy results</button>
+</div>
+
+<script type="module">
+import { FilesetResolver, PoseLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.2/vision_bundle.mjs";
+import { createFile, MP4BoxBuffer, DataStream, Endianness } from "https://cdn.jsdelivr.net/npm/mp4box@2.5.0/dist/mp4box.all.mjs";
+
+// ------------------------------------------------------------------ settings (from PLAN.md, WP1b)
+const WASM_BASE = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.2/wasm";
+const MODELS = {
+  lite:  "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+  full:  "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
+  heavy: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task",
+};
+const PASS = {
+  framesMin: 570, framesMax: 630,   // frames received, for a 10-second 60 fps clip
+  fpsMin: 50,                       // frame rate of the file as Safari sees it
+  fullMaxSeconds: 180,              // Go if at least "full" finishes the clip in under 3 minutes
+  clipSecondsMin: 9.5, clipSecondsMax: 10.5,  // the frame range above assumes a 10-second clip
+};
+const POSE_OPTIONS = { numPoses: 1, minPoseDetectionConfidence: 0.5, minPosePresenceConfidence: 0.5, minTrackingConfidence: 0.5 }; // as config.py
+const VISIBILITY_MIN = 0.35;
+const RUN_KEY = "liftcoach-spike-run";
+// Skeleton as in liftcoach/render.py
+const CONNECTIONS = [[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[25,27],[24,26],[26,28],[27,29],[29,31],[27,31],[28,30],[30,32],[28,32]];
+
+// ------------------------------------------------------------------ page state
+const $ = (id) => document.getElementById(id);
+const view = $("view"), viewCtx = view.getContext("2d");
+let clip = null;          // parsed file: samples, decoder config, rotation, facts
+let stopRequested = false;
+let report = null;        // everything shown in the results box
+
+const save = (state) => { try { localStorage.setItem(RUN_KEY, JSON.stringify(state)); } catch {} };
+const load = () => { try { return JSON.parse(localStorage.getItem(RUN_KEY) || "null"); } catch { return null; } };
+
+// A run that was still "running" when the page loaded means the page crashed or was closed mid-run.
+const previous = load();
+if (previous && previous.status === "running") {
+  $("crash").style.display = "block";
+  $("crashText").textContent =
+    `It stopped during: ${previous.stage || "unknown"}. Safari probably reloaded the page (often running out of memory) or the screen locked. ` +
+    `What it had finished is shown in the results below.`;
+  report = previous.report;
+  render(report, true);
+  previous.status = "crashed";
+  save(previous);
+}
+
+// ------------------------------------------------------------------ reading the file
+async function parseClip(file) {
+  const buffer = await file.arrayBuffer();
+  return new Promise((resolve, reject) => {
+    const mp4 = createFile(true);   // keep media data: iPhone files may store the index after the frames
+    let track = null;
+    const samples = [];
+    mp4.onError = (module, message) => reject(new Error(`Could not read the file (${module}: ${message})`));
+    mp4.onReady = (info) => {
+      track = info.videoTracks && info.videoTracks[0];
+      if (!track) { reject(new Error("No video track found in this file.")); return; }
+      mp4.setExtractionOptions(track.id, null, { nbSamples: track.nb_samples });
+      mp4.start();
+    };
+    mp4.onSamples = (_id, _user, batch) => { for (const s of batch) samples.push(s); };
+    try {
+      mp4.appendBuffer(MP4BoxBuffer.fromArrayBuffer(buffer, 0));
+      mp4.flush();
+    } catch (error) { reject(error); return; }
+    if (!track) { reject(new Error("This file could not be read as a video (.MOV or .mp4).")); return; }
+
+    const entry = mp4.getTrackById(track.id).mdia.minf.stbl.stsd.entries[0];
+    const box = entry.avcC || entry.hvcC || entry.vpcC || entry.av1C;
+    let description;
+    if (box) {
+      const stream = new DataStream(undefined, 0, Endianness.BIG_ENDIAN);
+      box.write(stream);
+      description = new Uint8Array(stream.buffer, 8);   // skip the 8-byte box header
+    }
+    const m = Array.from(track.matrix || [65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824]);
+    const rotation = ((Math.round(Math.atan2(m[1], m[0]) * 180 / Math.PI) % 360) + 360) % 360;
+    const codedW = track.video ? track.video.width : track.track_width;
+    const codedH = track.video ? track.video.height : track.track_height;
+    const durationS = track.duration / track.timescale;
+    samples.sort((a, b) => a.cts - b.cts);   // presentation order, only for the facts below
+    resolve({
+      fileName: file.name, fileMB: file.size / 1e6, codec: track.codec,
+      codecName: /^(avc1|avc3)/.test(track.codec) ? "H.264" : /^(hvc1|hev1)/.test(track.codec) ? "HEVC" : track.codec,
+      codedW, codedH, rotation,
+      displayW: rotation % 180 ? codedH : codedW, displayH: rotation % 180 ? codedW : codedH,
+      durationS, samplesInFile: track.nb_samples, fileFps: track.nb_samples / durationS,
+      samplesRead: samples.length,
+      decodeOrder: samples.slice().sort((a, b) => a.number - b.number),
+      config: { codec: track.codec, codedWidth: codedW, codedHeight: codedH, description },
+    });
+  });
+}
+
+// ------------------------------------------------------------------ stepping through every frame
+// Decodes the whole clip once and calls onFrame(frame) for each frame, in order. Frames are closed afterwards.
+async function forEachFrame(onFrame) {
+  const queue = [];
+  let error = null, flushed = false, done = false, wake = null;
+  const poke = () => { if (wake) { const w = wake; wake = null; w(); } };
+  const decoder = new VideoDecoder({
+    output: (frame) => { queue.push(frame); poke(); },
+    error: (e) => { error = e; poke(); },
+  });
+  decoder.configure(clip.config);
+  const samples = clip.decodeOrder;
+  let next = 0;
+  try {
+    while (true) {
+      if (error) throw error;
+      if (stopRequested) throw new Error("stopped");
+      while (next < samples.length && queue.length + decoder.decodeQueueSize < 8) {
+        const s = samples[next++];
+        decoder.decode(new EncodedVideoChunk({
+          type: s.is_sync ? "key" : "delta",
+          timestamp: Math.round(s.cts * 1e6 / s.timescale),
+          duration: Math.round(s.duration * 1e6 / s.timescale),
+          data: s.data,
+        }));
+      }
+      if (next >= samples.length && !flushed) {
+        flushed = true;
+        decoder.flush().then(() => { done = true; poke(); }, (e) => { error = error || e; poke(); });
+      }
+      if (queue.length) {
+        const frame = queue.shift();
+        try { await onFrame(frame); } finally { frame.close(); }
+        continue;
+      }
+      if (done) break;
+      await Promise.race([new Promise((r) => { wake = r; }), new Promise((r) => setTimeout(r, 15))]);
+    }
+  } finally {
+    for (const f of queue) f.close();
+    if (decoder.state !== "closed") decoder.close();
+  }
+}
+
+// Draws a decoded frame upright (applying the file's rotation) into a full-size canvas for the pose model.
+const work = document.createElement("canvas");
+const workCtx = work.getContext("2d", { willReadFrequently: false });
+function drawUpright(frame) {
+  const w = clip.displayW, h = clip.displayH;
+  if (work.width !== w || work.height !== h) { work.width = w; work.height = h; }
+  workCtx.save();
+  workCtx.translate(w / 2, h / 2);
+  workCtx.rotate(clip.rotation * Math.PI / 180);
+  workCtx.drawImage(frame, -clip.codedW / 2, -clip.codedH / 2, clip.codedW, clip.codedH);
+  workCtx.restore();
+  return work;
+}
+
+function drawView(source, landmarks) {
+  const w = view.width, h = Math.round(view.width * clip.displayH / clip.displayW);
+  if (view.height !== h) view.height = h;
+  viewCtx.drawImage(source, 0, 0, w, h);
+  if (!landmarks) return;
+  viewCtx.lineWidth = 2; viewCtx.strokeStyle = "#00dc00"; viewCtx.fillStyle = "#ffff00";
+  for (const [a, b] of CONNECTIONS) {
+    const p = landmarks[a], q = landmarks[b];
+    if ((p.visibility ?? 1) < VISIBILITY_MIN || (q.visibility ?? 1) < VISIBILITY_MIN) continue;
+    viewCtx.beginPath(); viewCtx.moveTo(p.x * w, p.y * h); viewCtx.lineTo(q.x * w, q.y * h); viewCtx.stroke();
+  }
+  for (let i = 11; i < landmarks.length; i++) {
+    const p = landmarks[i];
+    if ((p.visibility ?? 1) < VISIBILITY_MIN) continue;
+    viewCtx.beginPath(); viewCtx.arc(p.x * w, p.y * h, 3, 0, 2 * Math.PI); viewCtx.fill();
+  }
+}
+
+// ------------------------------------------------------------------ the test
+function setStatus(text, fraction) {
+  $("status").textContent = text;
+  if (fraction !== undefined) $("bar").value = fraction;
+}
+
+async function decodePass() {
+  const times = [];
+  const t0 = performance.now();
+  await forEachFrame(async (frame) => {
+    times.push(frame.timestamp);
+    if (times.length % 30 === 0) {
+      drawView(drawUpright(frame), null);
+      setStatus(`Reading frames: ${times.length} of ${clip.samplesInFile}`, times.length / clip.samplesInFile);
+      await new Promise((r) => setTimeout(r, 0));
+    }
+  });
+  const seconds = (performance.now() - t0) / 1000;
+  const unique = new Set(times).size;
+  const sorted = times.slice().sort((a, b) => a - b);
+  const spanS = sorted.length > 1 ? (sorted[sorted.length - 1] - sorted[0]) / 1e6 : 0;
+  return {
+    framesReceived: times.length, uniqueTimestamps: unique,
+    increasing: times.every((t, i) => i === 0 || t > times[i - 1]),
+    measuredFps: spanS > 0 ? (sorted.length - 1) / spanS : 0,
+    seconds,
+  };
+}
+
+async function posePass(size, vision) {
+  const t0 = performance.now();
+  let landmarker, delegate = "GPU";
+  try {
+    landmarker = await PoseLandmarker.createFromOptions(vision, { baseOptions: { modelAssetPath: MODELS[size], delegate: "GPU" }, runningMode: "VIDEO", ...POSE_OPTIONS });
+  } catch (gpuError) {
+    delegate = "CPU";
+    landmarker = await PoseLandmarker.createFromOptions(vision, { baseOptions: { modelAssetPath: MODELS[size], delegate: "CPU" }, runningMode: "VIDEO", ...POSE_OPTIONS });
+  }
+  const loadSeconds = (performance.now() - t0) / 1000;
+  let frames = 0, withPose = 0, lastMs = -1;
+  const t1 = performance.now();
+  try {
+    await forEachFrame(async (frame) => {
+      const image = drawUpright(frame);
+      const ms = Math.max(Math.round(frame.timestamp / 1000), lastMs + 1);   // must strictly increase
+      lastMs = ms;
+      const result = landmarker.detectForVideo(image, ms);
+      const pose = result.landmarks && result.landmarks[0];
+      frames++;
+      if (pose) withPose++;
+      drawView(image, pose);
+      if (frames % 10 === 0) {
+        const elapsed = (performance.now() - t1) / 1000;
+        setStatus(`Pose model "${size}" (${delegate}): frame ${frames} of ${clip.samplesInFile}, ${elapsed.toFixed(0)} s so far`, frames / clip.samplesInFile);
+        await new Promise((r) => setTimeout(r, 0));   // let the screen update
+      }
+    });
+  } finally {
+    landmarker.close();
+  }
+  const seconds = (performance.now() - t1) / 1000;
+  return { size, delegate, loadSeconds, seconds, frames, withPose, msPerFrame: frames ? seconds * 1000 / frames : 0 };
+}
+
+async function runTest() {
+  const sizes = [...document.querySelectorAll(".models input:checked")].map((i) => i.value);
+  stopRequested = false;
+  $("run").disabled = true; $("stop").disabled = false; $("copy").disabled = true; $("file").disabled = true;
+  $("crash").style.display = "none";
+  let wakeLock = null;
+  try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {}
+
+  report = { startedAt: new Date().toISOString(), device: navigator.userAgent, clip: clipFacts(), decode: null, models: [], errors: [] };
+  const state = { status: "running", stage: "reading frames", report };
+  save(state);
+  render(report);
+  try {
+    report.decode = await decodePass();
+    save(state); render(report);
+    setStatus("Loading the pose model files...");
+    const vision = await FilesetResolver.forVisionTasks(WASM_BASE);
+    for (const size of sizes) {
+      state.stage = `pose model "${size}"`;
+      save(state);
+      try {
+        report.models.push(await posePass(size, vision));
+      } catch (error) {
+        if (stopRequested) throw error;
+        report.models.push({ size, error: String(error && error.message || error) });
+      }
+      save(state); render(report);
+    }
+    report.finished = true;
+    setStatus("Finished.", 1);
+  } catch (error) {
+    if (stopRequested) { report.stopped = true; setStatus("Stopped."); }
+    else { report.errors.push(String(error && error.message || error)); setStatus("Stopped by an error. See the results."); }
+  } finally {
+    state.status = "done"; save(state);
+    try { await wakeLock?.release(); } catch {}
+    render(report);
+    window.__spikeReport = report;   // read by the PC test script
+    $("run").disabled = false; $("stop").disabled = true; $("copy").disabled = false; $("file").disabled = false;
+  }
+}
+
+function clipFacts() {
+  return {
+    fileName: clip.fileName, fileMB: clip.fileMB, codec: clip.codec, codecName: clip.codecName,
+    codedW: clip.codedW, codedH: clip.codedH, rotation: clip.rotation, displayW: clip.displayW, displayH: clip.displayH,
+    durationS: clip.durationS, samplesInFile: clip.samplesInFile, samplesRead: clip.samplesRead, fileFps: clip.fileFps,
+  };
+}
+
+// ------------------------------------------------------------------ results box
+function judge(r) {
+  const checks = [];
+  if (r.decode) {
+    const d = r.decode;
+    checks.push({ name: "Frames received", ok: d.framesReceived >= PASS.framesMin && d.framesReceived <= PASS.framesMax && d.uniqueTimestamps === d.framesReceived,
+                  text: `${d.framesReceived}, ${d.uniqueTimestamps === d.framesReceived ? "all with different timestamps" : `only ${d.uniqueTimestamps} different timestamps`} [pass: ${PASS.framesMin} to ${PASS.framesMax}, all different]` });
+    checks.push({ name: "Frame rate as Safari sees it", ok: d.measuredFps >= PASS.fpsMin,
+                  text: `${d.measuredFps.toFixed(2)} fps from frame timestamps (file says ${r.clip.fileFps.toFixed(2)}) [pass: ${PASS.fpsMin} or more]` });
+  }
+  const full = r.models.find((m) => m.size === "full");
+  checks.push({ name: "Full model under 3 minutes", ok: !!(full && !full.error && full.frames && full.seconds < PASS.fullMaxSeconds),
+                text: full ? (full.error ? `error: ${full.error}` : `${full.seconds.toFixed(1)} s [pass: under ${PASS.fullMaxSeconds} s]`) : "not run" });
+  checks.push({ name: "No page crash", ok: !!r.finished, text: r.finished ? "the run finished" : (r.stopped ? "stopped by you" : "did not finish") });
+  return checks;
+}
+
+function render(r, fromCrash = false) {
+  if (!r) return;
+  const lines = [];
+  const c = r.clip;
+  lines.push("CLIP");
+  lines.push(`  ${c.fileName}, ${c.fileMB.toFixed(1)} MB`);
+  lines.push(`  Codec ${c.codecName} (${c.codec}), ${c.displayW} x ${c.displayH} upright (stored ${c.codedW} x ${c.codedH}, turned ${c.rotation}°)`);
+  lines.push(`  ${c.durationS.toFixed(2)} s, ${c.samplesInFile} frames in the file, ${c.fileFps.toFixed(2)} fps in the file`);
+  if (c.durationS < PASS.clipSecondsMin || c.durationS > PASS.clipSecondsMax)
+    lines.push(`  ! The frame-count pass range (${PASS.framesMin} to ${PASS.framesMax}) is for a 10-second clip. This one is ${c.durationS.toFixed(1)} s, so judge frames against ${c.samplesInFile} in the file instead.`);
+  if (c.displayW * c.displayH < 1080 * 1920 * 0.9)
+    lines.push(`  ! Smaller than 1080 x 1920: the phone may have shrunk the clip when it was chosen.`);
+  lines.push("");
+  if (r.decode) {
+    const d = r.decode;
+    lines.push("FRAMES");
+    lines.push(`  Received ${d.framesReceived} of ${c.samplesInFile}, ${d.uniqueTimestamps} different timestamps, ${d.increasing ? "always increasing" : "NOT always increasing"}`);
+    lines.push(`  Frame rate from timestamps: ${d.measuredFps.toFixed(2)} fps`);
+    lines.push(`  Reading every frame (no pose): ${d.seconds.toFixed(1)} s`);
+    lines.push("");
+  }
+  if (r.models.length) {
+    lines.push("POSE MODEL, SECONDS FOR THE WHOLE CLIP");
+    for (const m of r.models) {
+      if (m.error) { lines.push(`  ${m.size.padEnd(6)} error: ${m.error}`); continue; }
+      lines.push(`  ${m.size.padEnd(6)} ${m.seconds.toFixed(1).padStart(6)} s  (${m.msPerFrame.toFixed(0)} ms per frame, ${m.delegate}, model load ${m.loadSeconds.toFixed(1)} s, pose in ${(100 * m.withPose / Math.max(1, m.frames)).toFixed(0)}% of ${m.frames} frames)`);
+    }
+    lines.push("");
+  }
+  const checks = judge(r);
+  lines.push("TEST (PLAN.md, WP1b)");
+  for (const k of checks) lines.push(`  ${k.ok ? "PASS" : "FAIL"}  ${k.name}: ${k.text}`);
+  const go = checks.every((k) => k.ok);
+  const fits = r.models.filter((m) => !m.error && m.frames && m.seconds < PASS.fullMaxSeconds).map((m) => m.size);
+  const biggest = ["heavy", "full", "lite"].find((s) => fits.includes(s));
+  lines.push("");
+  lines.push(`Model sizes under 3 minutes: ${fits.length ? fits.join(", ") : "none"}`);
+  if (go && biggest) lines.push(`Model size to tune Phase A on: ${biggest} (the largest that finished in under 3 minutes)`);
+  if (r.errors.length) { lines.push(""); lines.push("ERRORS"); for (const e of r.errors) lines.push(`  ${e}`); }
+  lines.push("");
+  lines.push(`Phone: ${r.device}`);
+  lines.push(`Run started: ${r.startedAt}`);
+
+  const v = $("verdict");
+  if (r.finished) { v.textContent = go ? "GO" : "NO-GO"; v.className = "verdict " + (go ? "go" : "nogo"); }
+  else { v.textContent = fromCrash ? "Did not finish (crash)" : (r.stopped ? "Stopped" : "Running..."); v.className = "verdict warn"; }
+  $("results").textContent = lines.join("\n");
+  $("copy").disabled = false;
+}
+
+// ------------------------------------------------------------------ controls
+$("file").addEventListener("change", async () => {
+  const file = $("file").files[0];
+  if (!file) return;
+  $("run").disabled = true;
+  $("fileInfo").innerHTML = "<small>Reading the file...</small>";
+  try {
+    if (typeof VideoDecoder === "undefined") throw new Error("This browser cannot decode video frames (WebCodecs). Update the iPhone to the latest iOS and use Safari.");
+    clip = await parseClip(file);
+    const support = await VideoDecoder.isConfigSupported(clip.config);
+    if (!support.supported) throw new Error(`This browser cannot decode ${clip.codecName} (${clip.codec}). On the iPhone set Settings → Camera → Formats → Most Compatible and film again.`);
+    $("fileInfo").textContent = `${clip.fileName}: ${clip.codecName}, ${clip.displayW} x ${clip.displayH}, ${clip.durationS.toFixed(1)} s, ${clip.samplesInFile} frames, ${clip.fileFps.toFixed(1)} fps in the file.`;
+    $("run").disabled = false;
+    setStatus("Ready. Tap Run the test.", 0);
+  } catch (error) {
+    clip = null;
+    $("fileInfo").textContent = String(error && error.message || error);
+  }
+});
+$("run").addEventListener("click", () => { if (clip) runTest(); });
+$("stop").addEventListener("click", () => { stopRequested = true; $("stop").disabled = true; });
+$("copy").addEventListener("click", async () => {
+  const text = `Lifting Coach phone test: ${$("verdict").textContent}\n\n${$("results").textContent}`;
+  try { await navigator.clipboard.writeText(text); $("copy").textContent = "Copied"; }
+  catch { $("copy").textContent = "Copy failed: select the text and copy it"; }
+  setTimeout(() => { $("copy").textContent = "Copy results"; }, 2500);
+});
+</script>
+</body>
+</html>
