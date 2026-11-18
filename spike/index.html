@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Lifting Coach phone test</title>
 <!--
-  WP1b: can Safari on the iPhone do the analysis?
+  WP1b: can Chrome or Safari on iPhone do the analysis? (Both use Apple's WebKit engine.)
   Pick a clip from Photos. The page reads every frame of the file (WebCodecs + mp4box.js),
   runs the MediaPipe pose model at three sizes (lite, full, heavy), draws the skeleton,
   and fills in a results box. The video never leaves the phone: nothing is uploaded.
@@ -68,7 +68,7 @@
 </div>
 
 <div class="card">
-  <label class="pick" for="file">1. Choose a 10-second clip</label>
+  <label class="pick" for="file">1. Choose a clip (about 10 seconds)</label>
   <input type="file" id="file" accept="video/*,.mov,.mp4">
   <div id="fileInfo" style="margin-top:8px"><small>No clip chosen yet.</small></div>
   <div class="models">
@@ -105,10 +105,9 @@ const MODELS = {
   heavy: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task",
 };
 const PASS = {
-  framesMin: 570, framesMax: 630,   // frames received, for a 10-second 60 fps clip
-  fpsMin: 50,                       // frame rate of the file as Safari sees it
+  // frames received must equal the frames in the file, all with different timestamps
+  fpsMin: 50,                       // frame rate of the file as the browser sees it
   fullMaxSeconds: 180,              // Go if at least "full" finishes the clip in under 3 minutes
-  clipSecondsMin: 9.5, clipSecondsMax: 10.5,  // the frame range above assumes a 10-second clip
 };
 const POSE_OPTIONS = { numPoses: 1, minPoseDetectionConfidence: 0.5, minPosePresenceConfidence: 0.5, minTrackingConfidence: 0.5 }; // as config.py
 const VISIBILITY_MIN = 0.35;
@@ -131,7 +130,7 @@ const previous = load();
 if (previous && previous.status === "running") {
   $("crash").style.display = "block";
   $("crashText").textContent =
-    `It stopped during: ${previous.stage || "unknown"}. Safari probably reloaded the page (often running out of memory) or the screen locked. ` +
+    `It stopped during: ${previous.stage || "unknown"}. The browser probably reloaded the page (often running out of memory) or the screen locked. ` +
     `What it had finished is shown in the results below.`;
   report = previous.report;
   render(report, true);
@@ -382,9 +381,9 @@ function judge(r) {
   const checks = [];
   if (r.decode) {
     const d = r.decode;
-    checks.push({ name: "Frames received", ok: d.framesReceived >= PASS.framesMin && d.framesReceived <= PASS.framesMax && d.uniqueTimestamps === d.framesReceived,
-                  text: `${d.framesReceived}, ${d.uniqueTimestamps === d.framesReceived ? "all with different timestamps" : `only ${d.uniqueTimestamps} different timestamps`} [pass: ${PASS.framesMin} to ${PASS.framesMax}, all different]` });
-    checks.push({ name: "Frame rate as Safari sees it", ok: d.measuredFps >= PASS.fpsMin,
+    checks.push({ name: "Frames received", ok: d.framesReceived === r.clip.samplesInFile && d.uniqueTimestamps === d.framesReceived,
+                  text: `${d.framesReceived} of ${r.clip.samplesInFile} in the file, ${d.uniqueTimestamps === d.framesReceived ? "all with different timestamps" : `only ${d.uniqueTimestamps} different timestamps`} [pass: every frame in the file, all different]` });
+    checks.push({ name: "Frame rate as the browser sees it", ok: d.measuredFps >= PASS.fpsMin,
                   text: `${d.measuredFps.toFixed(2)} fps from frame timestamps (file says ${r.clip.fileFps.toFixed(2)}) [pass: ${PASS.fpsMin} or more]` });
   }
   const full = r.models.find((m) => m.size === "full");
@@ -402,8 +401,6 @@ function render(r, fromCrash = false) {
   lines.push(`  ${c.fileName}, ${c.fileMB.toFixed(1)} MB`);
   lines.push(`  Codec ${c.codecName} (${c.codec}), ${c.displayW} x ${c.displayH} upright (stored ${c.codedW} x ${c.codedH}, turned ${c.rotation}°)`);
   lines.push(`  ${c.durationS.toFixed(2)} s, ${c.samplesInFile} frames in the file, ${c.fileFps.toFixed(2)} fps in the file`);
-  if (c.durationS < PASS.clipSecondsMin || c.durationS > PASS.clipSecondsMax)
-    lines.push(`  ! The frame-count pass range (${PASS.framesMin} to ${PASS.framesMax}) is for a 10-second clip. This one is ${c.durationS.toFixed(1)} s, so judge frames against ${c.samplesInFile} in the file instead.`);
   if (c.displayW * c.displayH < 1080 * 1920 * 0.9)
     lines.push(`  ! Smaller than 1080 x 1920: the phone may have shrunk the clip when it was chosen.`);
   lines.push("");
@@ -428,10 +425,10 @@ function render(r, fromCrash = false) {
   for (const k of checks) lines.push(`  ${k.ok ? "PASS" : "FAIL"}  ${k.name}: ${k.text}`);
   const go = checks.every((k) => k.ok);
   const fits = r.models.filter((m) => !m.error && m.frames && m.seconds < PASS.fullMaxSeconds).map((m) => m.size);
-  const biggest = ["heavy", "full", "lite"].find((s) => fits.includes(s));
+  const largest = ["heavy", "full", "lite"].find((s) => fits.includes(s));
   lines.push("");
   lines.push(`Model sizes under 3 minutes: ${fits.length ? fits.join(", ") : "none"}`);
-  if (go && biggest) lines.push(`Model size to tune Phase A on: ${biggest} (the largest that finished in under 3 minutes)`);
+  if (largest) lines.push(`Largest model size under 3 minutes: ${largest}`);
   if (r.errors.length) { lines.push(""); lines.push("ERRORS"); for (const e of r.errors) lines.push(`  ${e}`); }
   lines.push("");
   lines.push(`Phone: ${r.device}`);
@@ -451,7 +448,7 @@ $("file").addEventListener("change", async () => {
   $("run").disabled = true;
   $("fileInfo").innerHTML = "<small>Reading the file...</small>";
   try {
-    if (typeof VideoDecoder === "undefined") throw new Error("This browser cannot decode video frames (WebCodecs). Update the iPhone to the latest iOS and use Safari.");
+    if (typeof VideoDecoder === "undefined") throw new Error("This browser cannot decode video frames (WebCodecs). Update the iPhone to the latest iOS and use Chrome or Safari.");
     clip = await parseClip(file);
     const support = await VideoDecoder.isConfigSupported(clip.config);
     if (!support.supported) throw new Error(`This browser cannot decode ${clip.codecName} (${clip.codec}). On the iPhone set Settings → Camera → Formats → Most Compatible and film again.`);
